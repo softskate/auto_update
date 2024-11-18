@@ -1,3 +1,4 @@
+import json
 import time
 from flask import Flask, request
 import os, psutil
@@ -13,7 +14,7 @@ app = Flask(__name__)
 
 open('logtext.log', 'wb')
 def log(*text):
-    open('logtext.log', 'a', -1, 'utf8').write(time.strftime("%Y-%m-%dT%H:%SZ ")+' '.join([str(x) for x in text])+'\n')
+    open(os.path.join(CURRENT_PROJECTS_DIR, 'logtext.log'), 'a', -1, 'utf8').write(time.strftime("%Y-%m-%dT%H:%SZ ")+' '.join([str(x) for x in text])+'\n')
 
 
 @app.route('/webhook/pull/<string:project_path>', methods=['POST'])
@@ -28,6 +29,12 @@ def webhook(project_path):
 
         if hmac.compare_digest(expected_signature, signature_header):
             log('[I]: Получена команда для обновления и перезапуска проекта', project_path)
+            json_data = json.loads(payload_body)
+
+            # Проверяем, если это push event
+            if not 'head_commit' in json_data:
+                return 'Done', 200
+
             project_path = f'{PROJECTS_DIR}/{project_path}'
             # Переход в директорию с проектом и выполнение команды
             log('[I]: Переходим в папку проекта...')
@@ -43,11 +50,10 @@ def webhook(project_path):
                     cmdline = process.info['cmdline']
                     process_file_dir = process.info['cwd']
 
-                    # Проверяем, что процесс является Python-процессом
-                    if cmdline and ("python" in cmdline[0] or "python3" in cmdline[0]) and process_file_dir:
+                    if process_file_dir:
                         # Проверяем наличие файла скрипта
                         if len(cmdline) > 1:
-                            if os.path.samefile(process_file_dir, project_path):
+                            if os.path.exists(process_file_dir) and os.path.samefile(process_file_dir, project_path):
                                 log('[I]: Проект найден. Заверщаю работы проекта для перезапуска...')
                                 process.terminate()
                                 time.sleep(.5)
@@ -66,16 +72,25 @@ def webhook(project_path):
                                 else:
                                     log('[C]: Не удалось перезагрузить проект!')
 
+                                os.chdir(project_path)
+                                venv = project_path+'/venv/bin/'
+                                
+                                if 'requirements.txt' in json_data['head_commit']['modified']:
+                                     log('[I]: Установка зависимостей...')
+                                     subprocess.run([venv+'python', '-m', 'pip', 'install', '-r','requirements.txt'])
+
+                                if cmdline[-1] != '&':
+                                    cmdline.extend(['>', 'output.log', '2>&1', '&'])
+
+                                launch_command = ['nohup', venv+cmdline[0].split('/')[-1], *cmdline[1:]]  # Полная команда запуска
+                                log(f'[I]: Запускаю проект по команде: [{" ".join(launch_command)}]')
+                                subprocess.run(launch_command)
+                                os.chdir(CURRENT_PROJECTS_DIR)
+
                                 break
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-                
-            launch_command = ['nohup', project_path+'/venv/bin/python', *cmdline[1:], '>', 'output.log', '2>&1', '&']  # Полная команда запуска
-            log(f'[I]: Запускаю проект по команде: [{" ".join(launch_command)}]')
-            os.chdir(project_path)
-            subprocess.run(launch_command)
-            os.chdir(CURRENT_PROJECTS_DIR)
 
             return 'Updated', 200
         else:
